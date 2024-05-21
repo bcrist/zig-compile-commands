@@ -18,7 +18,7 @@ First, `build.zig.zon`:
 
     .dependencies = .{
         .compile_commands = .{
-            .url = "git+https://github.com/bcrist/zig-compile-commands#master",
+            .url = "git+https://github.com/bcrist/zig-compile-commands#main",
         },
     }
 }
