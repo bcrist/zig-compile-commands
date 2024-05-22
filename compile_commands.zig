@@ -1,8 +1,5 @@
 const std = @import("std");
 
-// here's the static memory!!!!
-var compile_steps: []const *std.Build.Step.Compile = undefined;
-
 const CSourceFiles = std.Build.Module.CSourceFiles;
 
 const CompileCommandEntry = struct {
@@ -12,11 +9,24 @@ const CompileCommandEntry = struct {
     output: []const u8,
 };
 
+const CompileCommandOptions = struct {
+    target: ?*std.Build.Step.Compile = null,
+    targets: []const *std.Build.Step.Compile = &.{},
+    include_emitted_include_trees: bool = false,
+};
+
+// TODO use @fieldParentPtr to get this from the step instead of relying on a global
+var the_options: CompileCommandOptions = undefined;
+
 /// Note: you must call this *after* all other configuration in your build script!
-pub fn createStep(b: *std.Build, name: []const u8, targets: []const *std.Build.Step.Compile) void {
+pub fn createStep(b: *std.Build, name: []const u8, options: CompileCommandOptions) void {
     const step = b.allocator.create(std.Build.Step) catch @panic("Allocation failure, probably OOM");
 
-    compile_steps = b.allocator.dupe(*std.Build.Step.Compile, targets) catch @panic("OOM");
+    the_options = .{
+        .target = options.target,
+        .targets = b.allocator.dupe(*std.Build.Step.Compile, options.targets) catch @panic("OOM"),
+        .include_emitted_include_trees = options.include_emitted_include_trees,
+    };
 
     step.* = std.Build.Step.init(.{
         .id = .custom,
@@ -26,7 +36,8 @@ pub fn createStep(b: *std.Build, name: []const u8, targets: []const *std.Build.S
     });
 
     var compile_steps_list = std.ArrayList(*std.Build.Step.Compile).init(b.allocator);
-    compile_steps_list.appendSlice(compile_steps) catch @panic("OOM");
+    if (options.target) |target| compile_steps_list.append(target) catch @panic("OOM");
+    compile_steps_list.appendSlice(options.targets) catch @panic("OOM");
 
     var index: u32 = 0;
 
@@ -37,8 +48,18 @@ pub fn createStep(b: *std.Build, name: []const u8, targets: []const *std.Build.S
         for (compile_step.root_module.include_dirs.items) |include_dir| {
             switch (include_dir) {
                 .other_step => |compile| {
-                    _ = compile.getEmittedIncludeTree();
-                    step.dependOn(&compile.installed_headers_include_tree.?.step);
+                    for (compile.installed_headers.items) |install_header| {
+                        switch (install_header) {
+                            .file => {},
+                            .directory => |dir| {
+                                dir.source.addStepDependencies(step);
+                            },
+                        }
+                    }
+                    if (options.include_emitted_include_trees) {
+                        _ = compile.getEmittedIncludeTree();
+                        step.dependOn(&compile.installed_headers_include_tree.?.step);
+                    }
                 },
                 .path, .path_system, .path_after, .framework_path, .framework_path_system => |path| {
                     path.addStepDependencies(step);
@@ -75,13 +96,24 @@ const GraphSerializeError = error{InvalidHeader};
 /// A compilation step has an "include_dirs" array list, which contains paths as
 /// well as other compile steps. This loops until all the include directories
 /// necessary for good intellisense on the files compile by this step are found.
-pub fn extractIncludeDirsFromCompileStep(b: *std.Build, step: *std.Build.Step.Compile) []const []const u8 {
+pub fn extractIncludeDirsFromCompileStep(b: *std.Build, step: *std.Build.Step.Compile, include_emitted_include_trees: bool) []const []const u8 {
     var dirs = std.ArrayList([]const u8).init(b.allocator);
 
     for (step.root_module.include_dirs.items) |include_dir| {
         switch (include_dir) {
             .other_step => |compile| {
-                dirs.append(compile.getEmittedIncludeTree().getPath(compile.step.owner)) catch @panic("OOM");
+                for (compile.installed_headers.items) |install_header| {
+                    switch (install_header) {
+                        .file => {},
+                        .directory => |dir| {
+                            dirs.append(dir.source.getPath(compile.step.owner)) catch @panic("OOM");
+                        },
+                    }
+                }
+
+                if (include_emitted_include_trees) {
+                    dirs.append(compile.getEmittedIncludeTree().getPath(compile.step.owner)) catch @panic("OOM");
+                }
             },
             .path, .path_system, .path_after, .framework_path, .framework_path_system => |path| {
                 dirs.append(path.getPath(b)) catch @panic("OOM");
@@ -94,46 +126,52 @@ pub fn extractIncludeDirsFromCompileStep(b: *std.Build, step: *std.Build.Step.Co
     return dirs.toOwnedSlice() catch @panic("OOM");
 }
 
+const CSources = struct {
+    c_source_files: *CSourceFiles,
+    compile: *std.Build.Step.Compile,
+};
+
 // NOTE: some of the CSourceFiles pointed at by the elements of the returned
 // array are allocated with the allocator, some are not.
-fn getCSources(b: *std.Build, steps: []const *std.Build.Step.Compile) []*CSourceFiles {
+fn getCSources(b: *std.Build, options: CompileCommandOptions) []CSources {
     var allocator = b.allocator;
-    var res = std.ArrayList(*CSourceFiles).init(allocator);
+    var res = std.ArrayList(CSources).init(allocator);
 
     // move the compile steps into a mutable dynamic array, so we can add
     // any child steps
     var compile_steps_list = std.ArrayList(*std.Build.Step.Compile).init(b.allocator);
-    compile_steps_list.appendSlice(steps) catch @panic("OOM");
+    if (options.target) |target| compile_steps_list.append(target) catch @panic("OOM");
+    compile_steps_list.appendSlice(options.targets) catch @panic("OOM");
 
     var index: u32 = 0;
 
     // list may be appended to during the loop, so use a while
     while (index < compile_steps_list.items.len) {
-        const step = compile_steps_list.items[index];
+        const compile = compile_steps_list.items[index];
 
         var shared_flags = std.ArrayList([]const u8).init(allocator);
 
         // catch all the system libraries being linked, make flags out of them
-        for (step.root_module.link_objects.items) |link_object| {
+        for (compile.root_module.link_objects.items) |link_object| {
             switch (link_object) {
                 .system_lib => |lib| shared_flags.append(linkFlag(allocator, lib.name)) catch @panic("OOM"),
                 else => {},
             }
         }
 
-        if (step.is_linking_libc) {
+        if (compile.is_linking_libc) {
             shared_flags.append(linkFlag(allocator, "c")) catch @panic("OOM");
         }
-        if (step.is_linking_libcpp) {
+        if (compile.is_linking_libcpp) {
             shared_flags.append(linkFlag(allocator, "c++")) catch @panic("OOM");
         }
 
         // make flags out of all include directories
-        for (extractIncludeDirsFromCompileStep(b, step)) |include_dir| {
+        for (extractIncludeDirsFromCompileStep(b, compile, options.include_emitted_include_trees)) |include_dir| {
             shared_flags.append(includeFlag(b.allocator, include_dir)) catch @panic("OOM");
         }
 
-        for (step.root_module.link_objects.items) |link_object| {
+        for (compile.root_module.link_objects.items) |link_object| {
             switch (link_object) {
                 .static_path, .system_lib, .assembly_file, .win32_resource_file => continue,
                 .other_step => {
@@ -157,7 +195,10 @@ fn getCSources(b: *std.Build, steps: []const *std.Build.Step.Compile) []*CSource
                         .flags = flags.toOwnedSlice() catch @panic("OOM"),
                     };
 
-                    res.append(source_file) catch @panic("OOM");
+                    res.append(.{
+                        .c_source_files = source_file,
+                        .compile = compile,
+                    }) catch @panic("OOM");
                 },
                 .c_source_files => {
                     var source_files = link_object.c_source_files;
@@ -166,7 +207,10 @@ fn getCSources(b: *std.Build, steps: []const *std.Build.Step.Compile) []*CSource
                     flags.appendSlice(shared_flags.items) catch @panic("OOM");
                     source_files.flags = flags.toOwnedSlice() catch @panic("OOM");
 
-                    res.append(source_files) catch @panic("OOM");
+                    res.append(.{
+                        .c_source_files = source_files,
+                        .compile = compile,
+                    }) catch @panic("OOM");
                 },
             }
         }
@@ -189,17 +233,14 @@ fn makeCdb(step: *std.Build.Step, prog_node: *std.Progress.Node) anyerror!void {
     defer file.close();
 
     const cwd_string = try dirToString(cwd, allocator);
-    const c_sources = getCSources(step.owner, compile_steps);
+    const c_sources = getCSources(step.owner, the_options);
 
     // fill compile command entries, one for each file
-    for (c_sources) |c_source_file_set| {
-        const flags = c_source_file_set.flags;
-        for (c_source_file_set.files) |c_file| {
-            const file_str = if (std.fs.path.isAbsolute(c_file))
-                c_file
-            else
-                std.fs.path.join(allocator, &[_][]const u8{ cwd_string, c_file }) catch @panic("OOM");
-
+    for (c_sources) |sources| {
+        const flags = sources.c_source_files.flags;
+        for (sources.c_source_files.files) |c_file| {
+            const root = sources.c_source_files.root.getPath(sources.compile.step.owner);
+            const file_str = try std.fs.path.resolve(allocator, &.{ root, c_file });
             const output_str = std.fmt.allocPrint(allocator, "{s}.o", .{file_str}) catch @panic("OOM");
 
             var arguments = std.ArrayList([]const u8).init(allocator);
@@ -208,6 +249,7 @@ fn makeCdb(step: *std.Build.Step, prog_node: *std.Progress.Node) anyerror!void {
             arguments.append(c_file) catch @panic("OOM");
             arguments.appendSlice(&.{ "-o", std.fmt.allocPrint(allocator, "{s}.o", .{c_file}) catch @panic("OOM") }) catch @panic("OOM");
             arguments.appendSlice(flags) catch @panic("OOM");
+            arguments.appendSlice(sources.compile.root_module.c_macros.items) catch @panic("OOM");
 
             // add host native include dirs and libs
             // (doesn't really help unless your include dirs change after generating this)
