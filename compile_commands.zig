@@ -2,6 +2,8 @@ const std = @import("std");
 
 const CSourceFiles = std.Build.Module.CSourceFiles;
 
+const zig_version = @import("builtin").zig_version;
+
 const CompileCommandEntry = struct {
     arguments: []const []const u8,
     directory: []const u8,
@@ -220,7 +222,8 @@ fn getCSources(b: *std.Build, options: CompileCommandOptions) []CSources {
     return res.toOwnedSlice() catch @panic("OOM");
 }
 
-fn makeCdb(step: *std.Build.Step, prog_node: *std.Progress.Node) anyerror!void {
+const Progress_Node = if (zig_version.major > 0 or zig_version.minor >= 13) std.Progress.Node else *std.Progress.Node;
+fn makeCdb(step: *std.Build.Step, prog_node: Progress_Node) anyerror!void {
     _ = prog_node;
     const allocator = step.owner.allocator;
 
